@@ -1,4 +1,4 @@
-import { join, basename } from 'path';
+import { join, basename, resolve } from 'path';
 import { existsSync, readdirSync, readFileSync, statSync, accessSync, constants } from 'fs';
 import { execFileSync } from 'child_process';
 import TOML from '@iarna/toml';
@@ -77,7 +77,7 @@ function checkHookScriptsExist(codexHome) {
     return checks; // invalid JSON already caught by check #2
   }
 
-  const hookList = Array.isArray(hooks) ? hooks : (hooks.hooks || []);
+  const hookList = normalizeHookCommands(hooks);
   for (const hook of hookList) {
     if (!hook.command) continue;
 
@@ -203,13 +203,19 @@ function checkMcpCommands(codexHome) {
     if (!command) continue;
 
     try {
-      execFileSync('which', [command], { stdio: 'pipe' });
+      if (existsSync(command)) {
+        checks.push({ label: `MCP "${name}" command "${command}" is installed`, passed: true });
+        continue;
+      }
+
+      const lookup = process.platform === 'win32' ? 'where.exe' : 'which';
+      execFileSync(lookup, [command], { stdio: 'pipe' });
       checks.push({ label: `MCP "${name}" command "${command}" is installed`, passed: true });
     } catch {
       checks.push({
         label: `MCP "${name}" command "${command}" is installed`,
         passed: false,
-        reason: `"${command}" not found in PATH`,
+        reason: `"${command}" not found`,
       });
     }
   }
@@ -264,8 +270,9 @@ function checkMarketplaceJson(agentsHome) {
   // Check that referenced paths exist
   const entries = Array.isArray(mp) ? mp : (mp.plugins || []);
   for (const entry of entries) {
-    const refPath = entry.path || entry.dir || entry.name;
-    if (refPath && !existsSync(join(pluginsDir, refPath))) {
+    const refPath = entry.source?.path || entry.path || entry.dir || entry.name;
+    const candidate = refPath ? resolve(pluginsDir, refPath) : null;
+    if (candidate && !existsSync(candidate)) {
       return {
         label: 'marketplace.json paths are valid',
         passed: false,
@@ -308,6 +315,26 @@ function checkClaudeMdReferences(codexHome, agentsHome) {
 
 // --- helpers ---
 
+function normalizeHookCommands(hooks) {
+  if (Array.isArray(hooks)) return hooks;
+
+  const byEvent = hooks?.hooks || hooks || {};
+  if (Array.isArray(byEvent)) return byEvent;
+
+  const commands = [];
+  for (const eventConfig of Object.values(byEvent)) {
+    const groups = Array.isArray(eventConfig) ? eventConfig : [eventConfig];
+    for (const group of groups) {
+      const groupHooks = Array.isArray(group?.hooks) ? group.hooks : [];
+      for (const hook of groupHooks) {
+        if (hook?.command) commands.push(hook);
+      }
+    }
+  }
+
+  return commands;
+}
+
 /**
  * Recursively find files with a given name under a directory.
  */
@@ -324,7 +351,7 @@ function findFilesRecursive(dir, fileName) {
 
   for (const entry of entries) {
     const fullPath = join(dir, entry.name);
-    if (entry.isDirectory() && entry.name !== 'node_modules' && entry.name !== '.git' && entry.name !== 'backup') {
+    if (entry.isDirectory() && !['node_modules', '.git', 'backup', '.tmp', 'tmp', 'cache'].includes(entry.name)) {
       results.push(...findFilesRecursive(fullPath, fileName));
     } else if (entry.isFile() && entry.name === fileName) {
       results.push(fullPath);

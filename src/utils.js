@@ -103,10 +103,10 @@ export function normalizeMcpConfig(config = {}) {
  * Parse markdown frontmatter from a skill/agent file
  */
 export function parseFrontmatter(content) {
-  const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
   if (!match) return { frontmatter: {}, body: content };
 
-  const lines = match[1].split('\n');
+  const lines = match[1].split(/\r?\n/);
   const frontmatter = {};
   for (const line of lines) {
     const idx = line.indexOf(':');

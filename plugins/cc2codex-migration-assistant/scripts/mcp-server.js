@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync } from 'fs';
+import { appendFileSync, existsSync, readFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -10,6 +10,23 @@ const SERVER_VERSION = '0.6.0';
 const DEFAULT_PROTOCOL_VERSION = '2024-11-05';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, '..');
+const DEBUG_LOG = process.env.CC2CODEX_MCP_DEBUG_LOG || null;
+
+function debugLog(message, data = {}) {
+  if (!DEBUG_LOG) return;
+  try {
+    appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${message} ${JSON.stringify(data)}\n`);
+  } catch {
+    // Never write diagnostics to stdout/stderr; MCP stdio must stay clean.
+  }
+}
+
+debugLog('process-start', {
+  argv: process.argv,
+  cwd: process.cwd(),
+  repoRoot: process.env.CC2CODEX_REPO_ROOT || null,
+  node: process.version,
+});
 
 function detectRepoRoot() {
   const configured = process.env.CC2CODEX_REPO_ROOT;
@@ -760,12 +777,19 @@ function createSuccessResponse(id, result) {
 
 function writeMessage(message) {
   const payload = Buffer.from(JSON.stringify(message), 'utf-8');
+  debugLog('write-message', { id: message.id, hasError: !!message.error, resultKeys: message.result ? Object.keys(message.result) : [] });
   process.stdout.write(`Content-Length: ${payload.length}\r\n\r\n`);
   process.stdout.write(payload);
 }
 
+function writeLineMessage(message) {
+  debugLog('write-line-message', { id: message.id, hasError: !!message.error, resultKeys: message.result ? Object.keys(message.result) : [] });
+  process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
 async function handleRequest(request) {
   const { id, method, params = {} } = request;
+  debugLog('handle-request', { id, method });
 
   if (method === 'initialize') {
     return createSuccessResponse(id, {
@@ -815,9 +839,40 @@ async function handleRequest(request) {
 let pending = Buffer.alloc(0);
 
 process.stdin.on('data', async (chunk) => {
+  debugLog('stdin-data', { bytes: chunk.length, preview: chunk.toString('utf-8', 0, Math.min(chunk.length, 120)) });
   pending = Buffer.concat([pending, chunk]);
 
   while (true) {
+    const trimmedPending = pending.toString('utf-8').trimStart();
+    if (trimmedPending.startsWith('{')) {
+      const newlineIndex = pending.indexOf('\n');
+      const body = newlineIndex === -1 ? pending.toString('utf-8') : pending.slice(0, newlineIndex).toString('utf-8');
+      if (!body.trim()) break;
+
+      let request;
+      try {
+        request = JSON.parse(body);
+      } catch {
+        if (newlineIndex === -1) break;
+        pending = pending.slice(newlineIndex + 1);
+        continue;
+      }
+
+      pending = newlineIndex === -1 ? Buffer.alloc(0) : pending.slice(newlineIndex + 1);
+      try {
+        const response = await handleRequest(request);
+        if (response) {
+          writeLineMessage(response);
+        }
+      } catch (error) {
+        debugLog('handle-error', { message: error.message, stack: error.stack });
+        if (request.id !== undefined) {
+          writeLineMessage(createErrorResponse(request.id, error));
+        }
+      }
+      continue;
+    }
+
     // Some MCP clients use CRLF framing, others use LF-only framing.
     // Accept both to avoid startup hangs/timeouts.
     let headerEnd = pending.indexOf('\r\n\r\n');
@@ -834,6 +889,7 @@ process.stdin.on('data', async (chunk) => {
       .find((line) => line.toLowerCase().startsWith('content-length:'));
 
     if (!contentLengthHeader) {
+      debugLog('missing-content-length', { headerText });
       pending = pending.slice(headerEnd + headerSepLen);
       continue;
     }
@@ -851,6 +907,7 @@ process.stdin.on('data', async (chunk) => {
     try {
       request = JSON.parse(body);
     } catch (error) {
+      debugLog('json-parse-error', { message: error.message, body: body.slice(0, 200) });
       writeMessage(createErrorResponse(null, error));
       continue;
     }
@@ -861,11 +918,22 @@ process.stdin.on('data', async (chunk) => {
         writeMessage(response);
       }
     } catch (error) {
+      debugLog('handle-error', { message: error.message, stack: error.stack });
       if (request.id !== undefined) {
         writeMessage(createErrorResponse(request.id, error));
       }
     }
   }
+});
+
+process.stdin.on('end', () => debugLog('stdin-end'));
+process.stdin.on('error', error => debugLog('stdin-error', { message: error.message }));
+process.on('uncaughtException', error => {
+  debugLog('uncaught-exception', { message: error.message, stack: error.stack });
+  process.exit(1);
+});
+process.on('unhandledRejection', error => {
+  debugLog('unhandled-rejection', { message: error?.message || String(error), stack: error?.stack });
 });
 
 process.stdin.resume();
